@@ -10,7 +10,9 @@
     "start": "node dist/server.js",
     "db:migrate": "node dist/db/migrate.js",
     "db:migrate:alter": "node dist/db/alter-migrate.js",
-    "db:seed": "node dist/db/seed.js"
+    "db:seed": "node dist/db/seed.js",
+    "test": "vitest --run",
+    "test:watch": "vitest"
   },
   "keywords": [
     "typing",
@@ -46,10 +48,14 @@
     "@types/express": "^5.0.0",
     "@types/jsonwebtoken": "^9.0.7",
     "@types/node": "^22.13.5",
+    "@types/socket.io-client": "^1.4.36",
     "@types/uuid": "^10.0.0",
+    "@vitest/ui": "^4.1.2",
     "nodemon": "^3.1.9",
+    "socket.io-client": "^4.8.3",
     "ts-node": "^10.9.2",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "vitest": "^4.1.2"
   }
 }

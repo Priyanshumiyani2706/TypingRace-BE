@@ -269,6 +269,13 @@ export function initializeSocket(httpServer: HTTPServer) {
         socket.join(duelRoomCode);
         io.sockets.sockets.get(opponent.socketId)?.join(duelRoomCode);
 
+        // Track room code on socket instances for proper cleanup and debugging
+        socket.roomCode = duelRoomCode;
+        const opponentSocket = io.sockets.sockets.get(opponent.socketId);
+        if (opponentSocket) {
+          (opponentSocket as any).roomCode = duelRoomCode;
+        }
+
         // Fetch user data for both players
         const myUserData = socket.user.isGuest ? null : await User.findByPk(socket.user.id!, {
           attributes: ['id', 'display_name', 'profile_picture', 'avatar_id']
@@ -318,7 +325,7 @@ export function initializeSocket(httpServer: HTTPServer) {
     });
 
     socket.on('duel:progress', (data: { progress: number; wpm: number; accuracy: number; roomCode: string }) => {
-      socket.to(data.roomCode).emit('duel:opponent-progress', {
+      io.to(data.roomCode).emit('duel:opponent-progress', {
         userId: socket.user.id,
         username: socket.user.username,
         ...data,
@@ -389,6 +396,15 @@ export function initializeSocket(httpServer: HTTPServer) {
         } catch (error) {
           console.error('Error handling disconnect:', error);
         }
+      }
+
+      // Duel room cleanup
+      if (socket.roomCode && socket.roomCode.startsWith('DUEL_')) {
+        io.to(socket.roomCode).emit('duel:opponent-disconnected', {
+          userId: socket.user.id,
+          username: socket.user.username,
+        });
+        socket.leave(socket.roomCode);
       }
     });
   });
