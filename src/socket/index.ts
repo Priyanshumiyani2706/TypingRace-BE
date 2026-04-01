@@ -89,6 +89,56 @@ export function initializeSocket(httpServer: HTTPServer) {
         io.to(data.roomCode).emit('room:update', updatedRoom);
 
         socket.emit('room:joined', { room: updatedRoom, participantId: participant.id });
+
+        // If it's a duel room, send the duel:matched data so the playground can hydrate
+        if (updatedRoom?.room_type === 'duel') {
+          const { User, Match, MatchResult } = await import('../models/index.js');
+          const match = await Match.findOne({ where: { room_id: updatedRoom.id }, order: [['created_at', 'DESC']] });
+          
+          if (match) {
+            const participantsResult = await import('../services/roomService.js').then(m => m.roomService.getRoomById(updatedRoom.id));
+            const players = await Promise.all((participantsResult as any).participants.map(async (p: any) => {
+              const u = p.user_id ? await User.findByPk(p.user_id) : null;
+              return {
+                userId: p.user_id || `guest:${p.guest_id}`,
+                username: u?.display_name || p.display_name,
+                profile_picture: u?.profile_picture,
+                avatar_id: u?.avatar_id
+              };
+            }));
+
+            socket.emit('duel:matched', {
+              roomCode: updatedRoom.room_code,
+              roomId: updatedRoom.id,
+              matchId: match.id,
+              players
+            });
+
+            // Re-sync finished players
+            const results = await MatchResult.findAll({ where: { match_id: match.id } });
+            results.forEach(res => {
+              const p = players.find(player => player.userId === (res.user_id || `guest:${res.guest_id}`));
+              socket.emit('duel:player-finished', {
+                userId: res.user_id || `guest:${res.guest_id}`,
+                username: p?.username || 'Opponent',
+                wpm: res.wpm,
+                accuracy: res.accuracy,
+                timeTaken: res.time_taken
+              });
+            });
+            
+            // Also send the duel:start text if match is in progress
+            if (updatedRoom.status === 'in_progress') {
+              socket.emit('duel:start', { text: match.text_content, roomCode: updatedRoom.room_code });
+            }
+
+            // If match is already completed, send completion data
+            if (match.completed_at) {
+              const rankingUpdates = await rankingService.processMatchElo(match.id);
+              socket.emit('duel:complete', { rankingUpdates });
+            }
+          }
+        }
       } catch (error: any) {
         socket.emit('room:error', { message: error.message });
       }
@@ -265,15 +315,41 @@ export function initializeSocket(httpServer: HTTPServer) {
         matchmakingQueue.delete(userId);
         matchmakingQueue.delete(opponent.userId);
 
-        const duelRoomCode = `DUEL_${Date.now()}`;
+        const room = await roomService.createRoom({
+          hostUserId: userId.startsWith('guest:') ? null : userId,
+          roomType: 'duel',
+          maxPlayers: 2,
+          textContent: DUEL_TEXT
+        });
+        // Use getDataValue to safely retrieve the auto-generated UUID
+        const roomId = room.getDataValue('id') as string;
+        const match = await matchService.createMatch({
+          roomId: roomId,
+          matchType: 'duel',
+          textContent: DUEL_TEXT
+        });
+
+        // Safer property access for Sequelize instances with underscored: true
+        const duelRoomCode = room.getDataValue('room_code');
+        console.log(`[Matchmaking] Room created. ID: ${roomId}, Code: ${duelRoomCode}`);
+        
+        if (!duelRoomCode) {
+          console.error('[Matchmaking] FAILED to generate room code.');
+          socket.emit('duel:error', { message: 'Failed to create duel room' });
+          return;
+        }
         socket.join(duelRoomCode);
         io.sockets.sockets.get(opponent.socketId)?.join(duelRoomCode);
 
         // Track room code on socket instances for proper cleanup and debugging
         socket.roomCode = duelRoomCode;
+        socket.isDuelRoom = true;
+        socket.matchId = match.id;
         const opponentSocket = io.sockets.sockets.get(opponent.socketId);
         if (opponentSocket) {
           (opponentSocket as any).roomCode = duelRoomCode;
+          (opponentSocket as any).isDuelRoom = true;
+          (opponentSocket as any).matchId = match.id;
         }
 
         // Fetch user data for both players
@@ -287,6 +363,8 @@ export function initializeSocket(httpServer: HTTPServer) {
 
         const matchData = {
           roomCode: duelRoomCode,
+          roomId: roomId,
+          matchId: match.id,
           players: [
             {
               userId,
@@ -304,10 +382,14 @@ export function initializeSocket(httpServer: HTTPServer) {
         };
 
         io.to(duelRoomCode).emit('duel:matched', matchData);
-        io.to(duelRoomCode).emit('race:countdown', { countdown: 3 });
+        
+        // Add a small synchronization delay to ensure both clients have mounted the playground (or are ready in lobby)
         setTimeout(() => {
-          io.to(duelRoomCode).emit('duel:start', { text: DUEL_TEXT, roomCode: duelRoomCode });
-        }, 3000);
+          io.to(duelRoomCode).emit('race:countdown', { countdown: 3 });
+          setTimeout(() => {
+            io.to(duelRoomCode).emit('duel:start', { text: DUEL_TEXT, roomCode: duelRoomCode });
+          }, 3000);
+        }, 2000);
       } else {
         // Legacy fallback: also add to old queue for compatibility
         matchmakingQueue.set(userId, socket.id);
@@ -325,19 +407,66 @@ export function initializeSocket(httpServer: HTTPServer) {
     });
 
     socket.on('duel:progress', (data: { progress: number; wpm: number; accuracy: number; roomCode: string }) => {
-      io.to(data.roomCode).emit('duel:opponent-progress', {
+      socket.to(data.roomCode).emit('duel:opponent-progress', {
         userId: socket.user.id,
         username: socket.user.username,
         ...data,
       });
     });
 
-    socket.on('duel:finish', async (data: { wpm: number; accuracy: number; timeTaken: number; roomCode: string }) => {
-      io.to(data.roomCode).emit('duel:player-finished', {
-        userId: socket.user.id,
-        username: socket.user.username,
-        ...data,
-      });
+    socket.on('duel:finish', async (data: { wpm: number; accuracy: number; timeTaken: number; roomCode: string; matchId?: string }) => {
+      const matchId = data.matchId || socket.matchId;
+      if (data.roomCode && matchId) {
+        try {
+          const res = await matchService.saveResult({
+            matchId: matchId,
+            userId: socket.user.isGuest ? null : socket.user.id,
+            guestId: socket.user.isGuest ? socket.id : null,
+            wpm: data.wpm,
+            accuracy: data.accuracy,
+            timeTaken: data.timeTaken,
+          });
+
+          console.log(`[DuelFinish] Saved result for ${socket.user.username} in match ${matchId}. Room: ${data.roomCode}`);
+
+          io.to(data.roomCode).emit('duel:player-finished', {
+            userId: socket.user.id,
+            username: socket.user.username,
+            ...data,
+          });
+
+          // Check if match is already completed (in case of reloads or sync delay)
+          const { Match, MatchResult } = await import('../models/index.js');
+          const matchRecord = await Match.findByPk(matchId);
+          
+          if (matchRecord?.completed_at) {
+            console.log(`[DuelFinish] Match ${matchId} already completed. Resending completion data.`);
+            const rankingUpdates = await rankingService.processMatchElo(matchId);
+            socket.emit('duel:complete', { rankingUpdates });
+            return;
+          }
+
+          const resultsCount = await MatchResult.count({ where: { match_id: matchId } });
+          console.log(`[DuelFinish] Match ${matchId} results count: ${resultsCount}/2`);
+
+          // For a 1v1 duel, we expect 2 results
+          if (resultsCount >= 2) {
+            await matchService.completeMatch(matchId);
+            const rankingUpdates = await rankingService.processMatchElo(matchId);
+            
+            io.to(data.roomCode).emit('duel:complete', {
+              rankingUpdates
+            });
+
+            const room = await roomService.getRoomByCode(data.roomCode);
+            if (room) {
+              await roomService.updateRoomStatus(room.id, 'completed');
+            }
+          }
+        } catch (error) {
+          console.error('Error in duel:finish:', error);
+        }
+      }
     });
 
     // ── Challenge events ─────────────────────────────────────────────────────
@@ -398,12 +527,27 @@ export function initializeSocket(httpServer: HTTPServer) {
         }
       }
 
-      // Duel room cleanup
-      if (socket.roomCode && socket.roomCode.startsWith('DUEL_')) {
+      // Duel room cleanup and forfeit handling
+      if (socket.roomCode && socket.isDuelRoom) {
         io.to(socket.roomCode).emit('duel:opponent-disconnected', {
-          userId: socket.user.id,
+          userId: socket.user.id || `guest:${socket.id}`,
           username: socket.user.username,
         });
+
+        // Optional: If one player is already finished, trigger match completion early
+        if (socket.matchId) {
+          try {
+            const { MatchResult } = await import('../models/index.js');
+            const resultsCount = await MatchResult.count({ where: { match_id: socket.matchId } });
+            if (resultsCount >= 1) {
+              console.log(`[DuelDisconnect] One player finished, the other disconnected. Completing match ${socket.matchId}.`);
+              const rankingUpdates = await rankingService.processMatchElo(socket.matchId);
+              io.to(socket.roomCode).emit('duel:complete', { rankingUpdates });
+            }
+          } catch (e) {
+            console.error('Error completing duel on disconnect:', e);
+          }
+        }
         socket.leave(socket.roomCode);
       }
     });

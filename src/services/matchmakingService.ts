@@ -11,9 +11,9 @@ interface QueueEntry {
   joinedAt: number;
 }
 
-const ELO_RANGE_INITIAL = 200;   // initial XP range
-const ELO_RANGE_EXPAND = 100;    // expand by this every 10s
-const MAX_WAIT_MS = 60_000;      // after 60s, match anyone
+const ELO_RANGE_INITIAL = Infinity; // always match any two players – 1v1 duel
+const ELO_RANGE_EXPAND = 100;      // unused when Infinity, kept for future
+const MAX_WAIT_MS = 60_000;        // after 60s, match anyone
 
 class MatchmakingService {
   private queue: Map<string, QueueEntry> = new Map();
