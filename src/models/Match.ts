@@ -73,7 +73,7 @@ Match.init(
     sequelize,
     tableName: 'matches',
     underscored: true,
-    timestamps: false,
+    timestamps: true,
     indexes: [
       { fields: ['started_at'] },
       { fields: ['room_id'] },

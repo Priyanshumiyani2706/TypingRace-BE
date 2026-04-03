@@ -11,7 +11,6 @@ let sequelize: Sequelize;
 if (databaseUrl && databaseUrl.startsWith('postgresql://')) {
   sequelize = new Sequelize(databaseUrl, {
     dialect: 'postgres',
-    logging: process.env.NODE_ENV === 'development' ? console.log : false,
     pool: {
       max: 5,
       min: 0,
@@ -28,7 +27,6 @@ if (databaseUrl && databaseUrl.startsWith('postgresql://')) {
     database: process.env.DB_NAME || 'cyberrace',
     username: process.env.DB_USER || 'postgres',
     password: process.env.DB_PASSWORD || '',
-    logging: process.env.NODE_ENV === 'development' ? console.log : false,
     pool: {
       max: 5,
       min: 0,

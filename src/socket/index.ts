@@ -107,10 +107,13 @@ export function initializeSocket(httpServer: HTTPServer) {
               };
             }));
 
+            socket.matchId = match.getDataValue('id');
+            socket.isDuelRoom = true;
+
             socket.emit('duel:matched', {
               roomCode: updatedRoom.room_code,
               roomId: updatedRoom.id,
-              matchId: match.id,
+              matchId: match.getDataValue('id'),
               players
             });
 
@@ -342,14 +345,15 @@ export function initializeSocket(httpServer: HTTPServer) {
         io.sockets.sockets.get(opponent.socketId)?.join(duelRoomCode);
 
         // Track room code on socket instances for proper cleanup and debugging
+        const matchId = match.getDataValue('id');
         socket.roomCode = duelRoomCode;
         socket.isDuelRoom = true;
-        socket.matchId = match.id;
+        socket.matchId = matchId;
         const opponentSocket = io.sockets.sockets.get(opponent.socketId);
         if (opponentSocket) {
           (opponentSocket as any).roomCode = duelRoomCode;
           (opponentSocket as any).isDuelRoom = true;
-          (opponentSocket as any).matchId = match.id;
+          (opponentSocket as any).matchId = matchId;
         }
 
         // Fetch user data for both players
@@ -364,7 +368,7 @@ export function initializeSocket(httpServer: HTTPServer) {
         const matchData = {
           roomCode: duelRoomCode,
           roomId: roomId,
-          matchId: match.id,
+          matchId: match.getDataValue('id'),
           players: [
             {
               userId,
@@ -407,15 +411,20 @@ export function initializeSocket(httpServer: HTTPServer) {
     });
 
     socket.on('duel:progress', (data: { progress: number; wpm: number; accuracy: number; roomCode: string }) => {
+      const userId = socket.user.isGuest ? `guest:${socket.id}` : socket.user.id;
       socket.to(data.roomCode).emit('duel:opponent-progress', {
-        userId: socket.user.id,
+        userId: userId,
         username: socket.user.username,
         ...data,
       });
     });
 
     socket.on('duel:finish', async (data: { wpm: number; accuracy: number; timeTaken: number; roomCode: string; matchId?: string }) => {
-      const matchId = data.matchId || socket.matchId;
+      let matchId = data.matchId || socket.matchId;
+      
+      // Safety: JSON.stringify(undefined) becomes undefined, but sometimes clients send "undefined" string
+      if (matchId === 'undefined') matchId = socket.matchId;
+
       if (data.roomCode && matchId) {
         try {
           const res = await matchService.saveResult({
@@ -429,8 +438,11 @@ export function initializeSocket(httpServer: HTTPServer) {
 
           console.log(`[DuelFinish] Saved result for ${socket.user.username} in match ${matchId}. Room: ${data.roomCode}`);
 
+          const userId = socket.user.isGuest ? `guest:${socket.id}` : socket.user.id;
+          console.log(`[DuelFinish] Emitting duel:player-finished for ${socket.user.username} (${userId}) in room ${data.roomCode}`);
+
           io.to(data.roomCode).emit('duel:player-finished', {
-            userId: socket.user.id,
+            userId: userId,
             username: socket.user.username,
             ...data,
           });
@@ -454,6 +466,7 @@ export function initializeSocket(httpServer: HTTPServer) {
             await matchService.completeMatch(matchId);
             const rankingUpdates = await rankingService.processMatchElo(matchId);
             
+            console.log(`[DuelFinish] Match ${matchId} COMPLETE. Emitting duel:complete to room ${data.roomCode}`);
             io.to(data.roomCode).emit('duel:complete', {
               rankingUpdates
             });
