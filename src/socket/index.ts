@@ -107,7 +107,7 @@ export function initializeSocket(httpServer: HTTPServer) {
           socket.emit('room:joined', { room: updatedRoom, participantId: socket.participantId });
           return;
         }
-        
+
         const room = await roomService.getRoomByCode(normalizedCode);
         if (!room) {
           logger.warn('room not found', { roomCode: normalizedCode });
@@ -143,7 +143,7 @@ export function initializeSocket(httpServer: HTTPServer) {
         if (updatedRoom?.room_type === 'duel') {
           const { User, Match, MatchResult } = await getModels();
           const match = await Match.findOne({ where: { room_id: updatedRoom.id }, order: [['created_at', 'DESC']] });
-          
+
           if (match) {
             const participantsResult = await roomService.getRoomById(updatedRoom.id);
             const participants = (participantsResult as any)?.participants ?? [];
@@ -183,7 +183,7 @@ export function initializeSocket(httpServer: HTTPServer) {
                 timeTaken: res.time_taken
               });
             });
-            
+
             // Also send the duel:start text if match is in progress
             if (updatedRoom.status === 'in_progress') {
               socket.emit('duel:start', { text: match.text_content, roomCode: updatedRoom.room_code });
@@ -247,7 +247,7 @@ export function initializeSocket(httpServer: HTTPServer) {
           const room = await roomService.getRoomByCode(socket.roomCode);
           const hostPid = getHostParticipantId(room as any);
           const isHost = hostPid && socket.participantId && hostPid === socket.participantId;
-          
+
           logger.info('room:start', { roomCode: socket.roomCode, isHost, hostPid });
 
           if (room && isHost) {
@@ -404,7 +404,7 @@ export function initializeSocket(httpServer: HTTPServer) {
         // Safer property access for Sequelize instances with underscored: true
         const duelRoomCode = room.getDataValue('room_code');
         console.log(`[Matchmaking] Room created. ID: ${roomId}, Code: ${duelRoomCode}`);
-        
+
         if (!duelRoomCode) {
           console.error('[Matchmaking] FAILED to generate room code.');
           socket.emit('duel:error', { message: 'Failed to create duel room' });
@@ -455,7 +455,7 @@ export function initializeSocket(httpServer: HTTPServer) {
         };
 
         io.to(duelRoomCode).emit('duel:matched', matchData);
-        
+
         // Add a small synchronization delay to ensure both clients have mounted the playground (or are ready in lobby)
         setTimeout(() => {
           io.to(duelRoomCode).emit('race:countdown', { countdown: 3 });
@@ -490,7 +490,7 @@ export function initializeSocket(httpServer: HTTPServer) {
 
     socket.on('duel:finish', async (data: { wpm: number; accuracy: number; timeTaken: number; roomCode: string; matchId?: string }) => {
       let matchId = data.matchId || socket.matchId;
-      
+
       // Safety: JSON.stringify(undefined) becomes undefined, but sometimes clients send "undefined" string
       if (matchId === 'undefined') matchId = socket.matchId;
 
@@ -519,7 +519,7 @@ export function initializeSocket(httpServer: HTTPServer) {
           // Check if match is already completed (in case of reloads or sync delay)
           const { Match, MatchResult } = await import('../models/index.js');
           const matchRecord = await Match.findByPk(matchId);
-          
+
           if (matchRecord?.completed_at) {
             console.log(`[DuelFinish] Match ${matchId} already completed. Resending completion data.`);
             const rankingUpdates = await rankingService.processMatchElo(matchId);
@@ -534,7 +534,7 @@ export function initializeSocket(httpServer: HTTPServer) {
           if (resultsCount >= 2) {
             await matchService.completeMatch(matchId);
             const rankingUpdates = await rankingService.processMatchElo(matchId);
-            
+
             console.log(`[DuelFinish] Match ${matchId} COMPLETE. Emitting duel:complete to room ${data.roomCode}`);
             io.to(data.roomCode).emit('duel:complete', {
               rankingUpdates
