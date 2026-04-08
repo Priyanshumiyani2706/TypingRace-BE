@@ -15,6 +15,7 @@ import roomRoutes from './routes/room.js';
 import matchRoutes from './routes/match.js';
 import challengeRoutes from './routes/challenges.js';
 import statsRoutes from './routes/stats.js';
+import paragraphRoutes from './routes/paragraphs.js';
 import { apiLimiter, authLimiter } from './middleware/rateLimiter.js';
 
 dotenv.config();
@@ -50,6 +51,7 @@ app.use('/api/rooms', roomRoutes);
 app.use('/api/matches', matchRoutes);
 app.use('/api/challenges', challengeRoutes);
 app.use('/api/stats', statsRoutes);
+app.use('/api/paragraphs', paragraphRoutes);
 
 // 404 handler
 app.use((req, res) => {

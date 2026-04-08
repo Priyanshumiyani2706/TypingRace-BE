@@ -1,4 +1,4 @@
-import { Server as SocketIOServer } from 'socket.io';
+import { Server as SocketIOServer, type Socket } from 'socket.io';
 import { Server as HTTPServer } from 'http';
 import jwt from 'jsonwebtoken';
 import { roomService, getHostParticipantId } from '../services/roomService.js';
@@ -15,9 +15,28 @@ interface SocketUser {
   isGuest: boolean;
 }
 
-interface AuthenticatedSocket extends SocketIOServer {
-  user?: SocketUser;
-}
+type ServerToClientEvents = Record<string, (...args: any[]) => void>;
+type ClientToServerEvents = Record<string, (...args: any[]) => void>;
+
+type AuthedSocket = Socket<ClientToServerEvents, ServerToClientEvents> & {
+  user: SocketUser;
+  roomCode?: string;
+  participantId?: string;
+  matchId?: string;
+  isDuelRoom?: boolean;
+};
+
+let modelsPromise:
+  | Promise<{ User: any; Match: any; MatchResult: any }>
+  | null = null;
+const getModels = async () => {
+  modelsPromise ??= import('../models/index.js').then((m) => ({
+    User: (m as any).User,
+    Match: (m as any).Match,
+    MatchResult: (m as any).MatchResult,
+  }));
+  return modelsPromise;
+};
 
 export function initializeSocket(httpServer: HTTPServer) {
   const io = new SocketIOServer(httpServer, {
@@ -32,29 +51,31 @@ export function initializeSocket(httpServer: HTTPServer) {
   // Track online users: userId -> socketId
   const onlineUsers: Map<string, string> = new Map();
   // Authentication middleware
-  io.use((socket: any, next) => {
-    const token = socket.handshake.auth.token;
+  io.use((socket, next) => {
+    const s = socket as AuthedSocket;
+    const token = s.handshake.auth?.token;
+    const fallbackUsername = s.handshake.auth?.username || 'Guest';
 
     if (token && token !== 'guest') {
       try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET!) as any;
-        socket.user = {
+        s.user = {
           id: decoded.id,
-          username: decoded.username,
+          username: decoded.display_name || decoded.username || 'User',
           isGuest: false,
         };
       } catch (error) {
-        console.error('Socket auth error:', error);
-        socket.user = {
+        logger.warn('Socket auth error; falling back to guest', { error });
+        s.user = {
           id: null,
-          username: socket.handshake.auth.username || 'Guest',
+          username: fallbackUsername,
           isGuest: true,
         };
       }
     } else {
-      socket.user = {
+      s.user = {
         id: null,
-        username: socket.handshake.auth.username || 'Guest',
+        username: fallbackUsername,
         isGuest: true,
       };
     }
@@ -62,50 +83,81 @@ export function initializeSocket(httpServer: HTTPServer) {
     next();
   });
 
-  io.on('connection', (socket: any) => {
+  io.on('connection', (rawSocket) => {
+    const socket = rawSocket as AuthedSocket;
     logger.info(`User connected: ${socket.user.username} (${socket.id})`);
 
     // Room events
     socket.on('room:join', async (data: { roomCode: string }) => {
       try {
-        const room = await roomService.getRoomByCode(data.roomCode);
+        const normalizedCode = data.roomCode.toUpperCase();
+        logger.info('room:join', {
+          roomCode: normalizedCode,
+          original: data.roomCode,
+          username: socket.user.username,
+        });
+
+        // Idempotency: if this socket is already in this room, just re-sync state
+        if (socket.roomCode === normalizedCode && socket.participantId) {
+          logger.info('room:join idempotent re-sync', {
+            roomCode: normalizedCode,
+            participantId: socket.participantId,
+          });
+          const updatedRoom = await roomService.getRoomByCode(normalizedCode);
+          socket.emit('room:joined', { room: updatedRoom, participantId: socket.participantId });
+          return;
+        }
+        
+        const room = await roomService.getRoomByCode(normalizedCode);
         if (!room) {
+          logger.warn('room not found', { roomCode: normalizedCode });
           socket.emit('room:error', { message: 'Room not found' });
           return;
         }
 
-        const participant = await roomService.joinRoom({
-          roomId: room.id,
-          userId: socket.user.isGuest ? null : socket.user.id,
-          guestId: socket.user.isGuest ? socket.id : null,
-          displayName: socket.user.username,
+        logger.info('room found; joining participant', {
+          roomId: room.get('id'),
+          status: room.get('status'),
         });
 
-        socket.join(data.roomCode);
-        socket.roomCode = data.roomCode;
-        socket.participantId = participant.id;
+        const { participant, participantId } = await roomService.joinRoom({
+          roomId: room.get('id'),
+          userId: socket.user.isGuest ? null : socket.user.id,
+          guestId: socket.user.isGuest ? socket.id : null,
+          displayName: socket.user.username || 'Guest',
+        });
 
-        const updatedRoom = await roomService.getRoomByCode(data.roomCode);
-        io.to(data.roomCode).emit('room:update', updatedRoom);
+        logger.info('participant joined', { roomCode: normalizedCode, participantId });
 
-        socket.emit('room:joined', { room: updatedRoom, participantId: participant.id });
+        socket.join(normalizedCode);
+        socket.roomCode = normalizedCode;
+        socket.participantId = participantId;
+
+        const updatedRoom = await roomService.getRoomByCode(normalizedCode);
+        io.to(normalizedCode).emit('room:update', updatedRoom);
+
+        socket.emit('room:joined', { room: updatedRoom, participantId: participantId });
+        logger.info('room:joined emitted', { username: socket.user.username, roomCode: normalizedCode });
 
         // If it's a duel room, send the duel:matched data so the playground can hydrate
         if (updatedRoom?.room_type === 'duel') {
-          const { User, Match, MatchResult } = await import('../models/index.js');
+          const { User, Match, MatchResult } = await getModels();
           const match = await Match.findOne({ where: { room_id: updatedRoom.id }, order: [['created_at', 'DESC']] });
           
           if (match) {
-            const participantsResult = await import('../services/roomService.js').then(m => m.roomService.getRoomById(updatedRoom.id));
-            const players = await Promise.all((participantsResult as any).participants.map(async (p: any) => {
-              const u = p.user_id ? await User.findByPk(p.user_id) : null;
-              return {
-                userId: p.user_id || `guest:${p.guest_id}`,
-                username: u?.display_name || p.display_name,
-                profile_picture: u?.profile_picture,
-                avatar_id: u?.avatar_id
-              };
-            }));
+            const participantsResult = await roomService.getRoomById(updatedRoom.id);
+            const participants = (participantsResult as any)?.participants ?? [];
+            const players = await Promise.all(
+              participants.map(async (p: any) => {
+                const u = p.user_id ? await User.findByPk(p.user_id) : null;
+                return {
+                  userId: p.user_id || `guest:${p.guest_id}`,
+                  username: u?.display_name || p.display_name,
+                  profile_picture: u?.profile_picture,
+                  avatar_id: u?.avatar_id,
+                };
+              })
+            );
 
             socket.matchId = match.getDataValue('id');
             socket.isDuelRoom = true;
@@ -119,8 +171,10 @@ export function initializeSocket(httpServer: HTTPServer) {
 
             // Re-sync finished players
             const results = await MatchResult.findAll({ where: { match_id: match.id } });
-            results.forEach(res => {
-              const p = players.find(player => player.userId === (res.user_id || `guest:${res.guest_id}`));
+            results.forEach((res: any) => {
+              const p = players.find(
+                (player) => player.userId === (res.user_id || `guest:${res.guest_id}`)
+              );
               socket.emit('duel:player-finished', {
                 userId: res.user_id || `guest:${res.guest_id}`,
                 username: p?.username || 'Opponent',
@@ -169,7 +223,7 @@ export function initializeSocket(httpServer: HTTPServer) {
           }
           socket.leave(socket.roomCode);
         } catch (error) {
-          console.error('Error leaving room:', error);
+          logger.error('Error leaving room', { error });
         }
       }
     });
@@ -178,10 +232,11 @@ export function initializeSocket(httpServer: HTTPServer) {
       if (socket.participantId) {
         try {
           await roomService.setPlayerReady(socket.participantId, data.isReady);
+          if (!socket.roomCode) return;
           const updatedRoom = await roomService.getRoomByCode(socket.roomCode);
           io.to(socket.roomCode).emit('room:update', updatedRoom);
         } catch (error) {
-          console.error('Error setting ready status:', error);
+          logger.error('Error setting ready status', { error });
         }
       }
     });
@@ -192,13 +247,24 @@ export function initializeSocket(httpServer: HTTPServer) {
           const room = await roomService.getRoomByCode(socket.roomCode);
           const hostPid = getHostParticipantId(room as any);
           const isHost = hostPid && socket.participantId && hostPid === socket.participantId;
+          
+          logger.info('room:start', { roomCode: socket.roomCode, isHost, hostPid });
+
           if (room && isHost) {
-            // Check if all players are ready
+            // Check if all OTHER players are ready
             const participants = (room as any).participants || [];
-            const allReady = participants.every((p: any) => p.is_ready);
+            const nonHostParticipants = participants.filter((p: any) => p.id !== hostPid);
+            const allReady = nonHostParticipants.every((p: any) => p.is_ready);
             const minPlayers = participants.length >= 2;
 
+            logger.info('room:start validation', {
+              participants: participants.length,
+              nonHostReady: allReady,
+              minPlayersMet: minPlayers,
+            });
+
             if (!allReady || !minPlayers) {
+              logger.info('room:start failed validation');
               socket.emit('room:error', { message: 'Not all players are ready or minimum players not met' });
               return;
             }
@@ -213,10 +279,11 @@ export function initializeSocket(httpServer: HTTPServer) {
             socket.matchId = match.id;
 
             await roomService.updateRoomStatus(room.id, 'in_progress');
-            io.to(socket.roomCode).emit('race:countdown', { countdown: 3 });
+            const roomCode = socket.roomCode;
+            io.to(roomCode).emit('race:countdown', { countdown: 3 });
 
             setTimeout(() => {
-              io.to(socket.roomCode).emit('race:start', {
+              io.to(roomCode).emit('race:start', {
                 text: room.text_content,
                 matchId: match.id,
               });
@@ -225,7 +292,7 @@ export function initializeSocket(httpServer: HTTPServer) {
             socket.emit('room:error', { message: 'Only the host can start the race' });
           }
         } catch (error) {
-          console.error('Error starting race:', error);
+          logger.error('Error starting race', { error });
           socket.emit('room:error', { message: 'Failed to start race' });
         }
       }
@@ -246,7 +313,7 @@ export function initializeSocket(httpServer: HTTPServer) {
         try {
           const room = await roomService.getRoomByCode(socket.roomCode);
           if (room && data.matchId) {
-            // Save individual result
+            // Save individual result (idempotent — matchService should handle duplicates)
             await matchService.saveResult({
               matchId: data.matchId,
               userId: socket.user.isGuest ? null : socket.user.id,
@@ -262,18 +329,19 @@ export function initializeSocket(httpServer: HTTPServer) {
               ...data,
             });
 
-            // Check if all players have finished
-            const participants = (room as any).participants || [];
-            const sockets = await io.in(socket.roomCode).fetchSockets();
-            const finishedCount = sockets.filter((s: any) => s.hasFinished).length + 1;
+            // Check if all active players have submitted results using DB count (reliable across reconnects)
+            const { MatchResult } = await import('../models/index.js');
+            const participantCount = (room as any).participants?.length || 0;
+            const resultsCount = await MatchResult.count({ where: { match_id: data.matchId } });
 
-            socket.hasFinished = true;
+            console.log(`[RaceFinish] Match ${data.matchId}: ${resultsCount}/${participantCount} results submitted.`);
 
-            if (finishedCount >= participants.length) {
-              // All players finished, complete the match
+            if (resultsCount >= participantCount && participantCount > 0) {
+              // All players finished — complete the match
               const { match, results } = await matchService.completeMatch(data.matchId);
               await roomService.updateRoomStatus(room.id, 'completed');
 
+              console.log(`[RaceFinish] Match ${data.matchId} COMPLETE. Emitting race:complete.`);
               io.to(socket.roomCode).emit('race:complete', {
                 match,
                 results,
@@ -285,6 +353,7 @@ export function initializeSocket(httpServer: HTTPServer) {
         }
       }
     });
+
 
     socket.on('room:chat', (data: { message: string }) => {
       if (socket.roomCode) {

@@ -34,15 +34,34 @@ export const matchService = {
   },
 
   async saveResult(data: SaveResultData) {
-    const result = await MatchResult.create({
-      match_id: data.matchId,
-      user_id: data.userId,
-      guest_id: data.guestId,
-      wpm: data.wpm,
-      accuracy: data.accuracy,
-      position: 0, // Will be updated when all results are in
-      time_taken: data.timeTaken,
+    // Build the lookup key — unique per player per match
+    const whereClause: Record<string, unknown> = { match_id: data.matchId };
+    if (data.userId) {
+      whereClause.user_id = data.userId;
+    } else if (data.guestId) {
+      whereClause.guest_id = data.guestId;
+    }
+
+    // findOrCreate ensures idempotency: re-submitting a result (e.g. on reconnect)
+    // updates the existing row instead of creating a duplicate.
+    const [result, created] = await MatchResult.findOrCreate({
+      where: whereClause,
+      defaults: {
+        match_id: data.matchId,
+        user_id: data.userId,
+        guest_id: data.guestId,
+        wpm: data.wpm,
+        accuracy: data.accuracy,
+        position: 0,
+        time_taken: data.timeTaken,
+      },
     });
+
+    if (!created) {
+      // Update with the latest values in case of a retry
+      await result.update({ wpm: data.wpm, accuracy: data.accuracy, time_taken: data.timeTaken });
+    }
+
     return result;
   },
 

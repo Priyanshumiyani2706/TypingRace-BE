@@ -10,6 +10,7 @@ import Match from './Match.js';
 import MatchResult from './MatchResult.js';
 import Friend from './Friend.js';
 import Challenge from './Challenge.js';
+import Paragraph from './Paragraph.js';
 
 // Define associations
 User.hasMany(TestResult, { foreignKey: 'user_id', as: 'testResults' });
@@ -57,4 +58,5 @@ export {
   User, TestResult, Trophy, UserTrophy, Avatar, Activity,
   Room, RoomParticipant, Match, MatchResult,
   Friend, Challenge,
+  Paragraph,
 };

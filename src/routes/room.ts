@@ -5,6 +5,7 @@ import {
   getRoomByCode,
   getRoomById,
   getPublicRooms,
+  joinRandomRoom,
   updateRoom,
   deleteRoom,
 } from '../controllers/roomController.js';
@@ -14,6 +15,7 @@ const router = express.Router();
 
 router.post('/', guestOrAuth, validate(schemas.createRoom), createRoom);
 router.get('/public', getPublicRooms);
+router.get('/join-random', joinRandomRoom);
 router.get('/code/:code', getRoomByCode);
 router.get('/:id', getRoomById);
 router.patch('/:id', guestOrAuth, updateRoom);

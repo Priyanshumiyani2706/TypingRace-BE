@@ -20,8 +20,25 @@ export const createRoom = async (req: Request, res: Response): Promise<void> => 
 
     res.status(201).json(room);
   } catch (error) {
-    console.error('Error creating room:', error);
+    console.error('[RoomController] Error creating room:', error);
     res.status(500).json({ error: 'Failed to create room' });
+  }
+};
+
+export const joinRandomRoom = async (req: Request, res: Response): Promise<void> => {
+  try {
+    console.log('[RoomController] joinRandomRoom called');
+    const room = await roomService.findAvailablePublicRoom();
+    if (!room) {
+      console.log('[RoomController] No available room found for joinRandom');
+      res.status(404).json({ error: 'No available rooms' });
+      return;
+    }
+    console.log(`[RoomController] Sending available room back: ${room.room_code}`);
+    res.json(room);
+  } catch (error) {
+    console.error('[RoomController] Error in joinRandomRoom:', error);
+    res.status(500).json({ error: 'Failed to find a room' });
   }
 };
 
