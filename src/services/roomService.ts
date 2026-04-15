@@ -62,7 +62,7 @@ export const roomService = {
   },
 
   async getRoomByCode(roomCode: string) {
-    const normalizedCode = roomCode.toUpperCase();
+    const normalizedCode = roomCode.trim().toUpperCase();
     console.log(`[RoomService] Fetching room by code: ${normalizedCode} (original: ${roomCode})`);
     const room = await Room.findOne({
       where: { room_code: normalizedCode },

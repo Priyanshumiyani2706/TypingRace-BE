@@ -13,6 +13,7 @@ interface SocketUser {
   id: string | null;
   username: string;
   isGuest: boolean;
+  guestId?: string | null;
 }
 
 type ServerToClientEvents = Record<string, (...args: any[]) => void>;
@@ -26,6 +27,28 @@ type AuthedSocket = Socket<ClientToServerEvents, ServerToClientEvents> & {
   isDuelRoom?: boolean;
 };
 
+interface DuelSessionState {
+  roomCode: string;
+  matchId: string;
+  text: string;
+  startedAt?: string;
+}
+
+interface DuelParticipantState {
+  playerId: string;
+  username: string;
+  socketId: string;
+  userId: string | null;
+  guestId: string | null;
+}
+
+interface DuelProgressState {
+  progress: number;
+  wpm: number;
+  accuracy: number;
+  timeTaken?: number;
+}
+
 let modelsPromise:
   | Promise<{ User: any; Match: any; MatchResult: any }>
   | null = null;
@@ -37,6 +60,10 @@ const getModels = async () => {
   }));
   return modelsPromise;
 };
+
+const getGuestIdentity = (socket: AuthedSocket) => socket.user.guestId || socket.id;
+const getSocketPlayerId = (socket: AuthedSocket) =>
+  socket.user.isGuest ? `guest:${getGuestIdentity(socket)}` : socket.user.id!;
 
 export function initializeSocket(httpServer: HTTPServer) {
   const io = new SocketIOServer(httpServer, {
@@ -50,11 +77,17 @@ export function initializeSocket(httpServer: HTTPServer) {
   const matchmakingQueue: Map<string, string> = new Map();
   // Track online users: userId -> socketId
   const onlineUsers: Map<string, string> = new Map();
+  // Track duel start timestamps so refreshed clients can restore the real timer.
+  const duelSessions: Map<string, DuelSessionState> = new Map();
+  const duelParticipants: Map<string, DuelParticipantState[]> = new Map();
+  const duelProgress: Map<string, Map<string, DuelProgressState>> = new Map();
+  const duelForfeitedPlayers: Map<string, Set<string>> = new Map();
   // Authentication middleware
   io.use((socket, next) => {
     const s = socket as AuthedSocket;
     const token = s.handshake.auth?.token;
     const fallbackUsername = s.handshake.auth?.username || 'Guest';
+    const guestId = s.handshake.auth?.guestId || null;
 
     if (token && token !== 'guest') {
       try {
@@ -63,6 +96,7 @@ export function initializeSocket(httpServer: HTTPServer) {
           id: decoded.id,
           username: decoded.display_name || decoded.username || 'User',
           isGuest: false,
+          guestId: null,
         };
       } catch (error) {
         logger.warn('Socket auth error; falling back to guest', { error });
@@ -70,6 +104,7 @@ export function initializeSocket(httpServer: HTTPServer) {
           id: null,
           username: fallbackUsername,
           isGuest: true,
+          guestId: guestId,
         };
       }
     } else {
@@ -77,6 +112,7 @@ export function initializeSocket(httpServer: HTTPServer) {
         id: null,
         username: fallbackUsername,
         isGuest: true,
+        guestId: guestId,
       };
     }
 
@@ -120,10 +156,22 @@ export function initializeSocket(httpServer: HTTPServer) {
           status: room.get('status'),
         });
 
+        const joiningPlayerId = getSocketPlayerId(socket);
+        if (room.room_type === 'duel' && duelForfeitedPlayers.get(normalizedCode)?.has(joiningPlayerId)) {
+          socket.emit('duel:rejoin-blocked', {
+            roomCode: normalizedCode,
+            reason: 'forfeit_on_disconnect',
+          });
+          socket.emit('room:error', {
+            message: 'You forfeited this duel by leaving and cannot rejoin.',
+          });
+          return;
+        }
+
         const { participant, participantId } = await roomService.joinRoom({
           roomId: room.get('id'),
           userId: socket.user.isGuest ? null : socket.user.id,
-          guestId: socket.user.isGuest ? socket.id : null,
+          guestId: socket.user.isGuest ? (socket.user.guestId || socket.id) : null,
           displayName: socket.user.username || 'Guest',
         });
 
@@ -161,6 +209,12 @@ export function initializeSocket(httpServer: HTTPServer) {
 
             socket.matchId = match.getDataValue('id');
             socket.isDuelRoom = true;
+            const session: DuelSessionState = duelSessions.get(updatedRoom.room_code) || {
+              roomCode: updatedRoom.room_code,
+              matchId: match.getDataValue('id'),
+              text: match.text_content,
+            };
+            duelSessions.set(updatedRoom.room_code, session);
 
             socket.emit('duel:matched', {
               roomCode: updatedRoom.room_code,
@@ -186,7 +240,11 @@ export function initializeSocket(httpServer: HTTPServer) {
 
             // Also send the duel:start text if match is in progress
             if (updatedRoom.status === 'in_progress') {
-              socket.emit('duel:start', { text: match.text_content, roomCode: updatedRoom.room_code });
+              socket.emit('duel:start', {
+                text: session.text,
+                roomCode: updatedRoom.room_code,
+                startedAt: session.startedAt,
+              });
             }
 
             // If match is already completed, send completion data
@@ -373,7 +431,7 @@ export function initializeSocket(httpServer: HTTPServer) {
 
     // ── Duel matchmaking (ELO-based; guests use synthetic id + xp 0 so they can match real players) ──
     socket.on('duel:matchmaking', async () => {
-      const userId = socket.user.isGuest ? `guest:${socket.id}` : socket.user.id!;
+      const userId = getSocketPlayerId(socket);
       const { User } = await import('../models/index.js');
       const xp = socket.user.isGuest ? 0 : (await User.findByPk(socket.user.id!, { attributes: ['xp'] }))?.xp || 0;
 
@@ -412,6 +470,11 @@ export function initializeSocket(httpServer: HTTPServer) {
         }
         socket.join(duelRoomCode);
         io.sockets.sockets.get(opponent.socketId)?.join(duelRoomCode);
+        duelSessions.set(duelRoomCode, {
+          roomCode: duelRoomCode,
+          matchId: match.getDataValue('id'),
+          text: DUEL_TEXT,
+        });
 
         // Track room code on socket instances for proper cleanup and debugging
         const matchId = match.getDataValue('id');
@@ -454,13 +517,42 @@ export function initializeSocket(httpServer: HTTPServer) {
           ],
         };
 
+        duelParticipants.set(duelRoomCode, [
+          {
+            playerId: userId,
+            username: myUserData?.display_name || socket.user.username,
+            socketId: socket.id,
+            userId: socket.user.isGuest ? null : socket.user.id,
+            guestId: socket.user.isGuest ? getGuestIdentity(socket) : null,
+          },
+          {
+            playerId: opponent.userId,
+            username: opponentUserData?.display_name || opponent.username,
+            socketId: opponent.socketId,
+            userId: opponent.userId.startsWith('guest:') ? null : opponent.userId,
+            guestId: opponent.userId.startsWith('guest:') ? opponent.socketId : null,
+          },
+        ]);
+        duelProgress.set(duelRoomCode, new Map());
+
         io.to(duelRoomCode).emit('duel:matched', matchData);
 
         // Add a small synchronization delay to ensure both clients have mounted the playground (or are ready in lobby)
         setTimeout(() => {
           io.to(duelRoomCode).emit('race:countdown', { countdown: 3 });
           setTimeout(() => {
-            io.to(duelRoomCode).emit('duel:start', { text: DUEL_TEXT, roomCode: duelRoomCode });
+            const startedAt = new Date().toISOString();
+            duelSessions.set(duelRoomCode, {
+              roomCode: duelRoomCode,
+              matchId,
+              text: DUEL_TEXT,
+              startedAt,
+            });
+            io.to(duelRoomCode).emit('duel:start', {
+              text: DUEL_TEXT,
+              roomCode: duelRoomCode,
+              startedAt,
+            });
           }, 3000);
         }, 2000);
       } else {
@@ -472,7 +564,7 @@ export function initializeSocket(httpServer: HTTPServer) {
 
     socket.on('duel:cancel', () => {
       if (socket.user.isGuest) {
-        matchmakingService.dequeue(`guest:${socket.id}`);
+        matchmakingService.dequeue(getSocketPlayerId(socket));
       } else if (socket.user.id) {
         matchmakingQueue.delete(socket.user.id);
         matchmakingService.dequeue(socket.user.id);
@@ -480,7 +572,14 @@ export function initializeSocket(httpServer: HTTPServer) {
     });
 
     socket.on('duel:progress', (data: { progress: number; wpm: number; accuracy: number; roomCode: string }) => {
-      const userId = socket.user.isGuest ? `guest:${socket.id}` : socket.user.id;
+      const userId = getSocketPlayerId(socket);
+      const roomProgress = duelProgress.get(data.roomCode);
+      roomProgress?.set(userId, {
+        progress: data.progress,
+        wpm: data.wpm,
+        accuracy: data.accuracy,
+      });
+
       socket.to(data.roomCode).emit('duel:opponent-progress', {
         userId: userId,
         username: socket.user.username,
@@ -496,10 +595,19 @@ export function initializeSocket(httpServer: HTTPServer) {
 
       if (data.roomCode && matchId) {
         try {
+          const progressPlayerId = getSocketPlayerId(socket);
+          const roomProgress = duelProgress.get(data.roomCode);
+          roomProgress?.set(progressPlayerId, {
+            progress: 100,
+            wpm: data.wpm,
+            accuracy: data.accuracy,
+            timeTaken: data.timeTaken,
+          });
+
           const res = await matchService.saveResult({
             matchId: matchId,
             userId: socket.user.isGuest ? null : socket.user.id,
-            guestId: socket.user.isGuest ? socket.id : null,
+            guestId: socket.user.isGuest ? getGuestIdentity(socket) : null,
             wpm: data.wpm,
             accuracy: data.accuracy,
             timeTaken: data.timeTaken,
@@ -507,7 +615,7 @@ export function initializeSocket(httpServer: HTTPServer) {
 
           console.log(`[DuelFinish] Saved result for ${socket.user.username} in match ${matchId}. Room: ${data.roomCode}`);
 
-          const userId = socket.user.isGuest ? `guest:${socket.id}` : socket.user.id;
+          const userId = getSocketPlayerId(socket);
           console.log(`[DuelFinish] Emitting duel:player-finished for ${socket.user.username} (${userId}) in room ${data.roomCode}`);
 
           io.to(data.roomCode).emit('duel:player-finished', {
@@ -544,6 +652,9 @@ export function initializeSocket(httpServer: HTTPServer) {
             if (room) {
               await roomService.updateRoomStatus(room.id, 'completed');
             }
+            duelSessions.delete(data.roomCode);
+            duelParticipants.delete(data.roomCode);
+            duelProgress.delete(data.roomCode);
           }
         } catch (error) {
           console.error('Error in duel:finish:', error);
@@ -577,7 +688,7 @@ export function initializeSocket(httpServer: HTTPServer) {
       logger.info(`User disconnected: ${socket.user.username} (${socket.id})`);
 
       if (socket.user.isGuest) {
-        matchmakingService.dequeue(`guest:${socket.id}`);
+        matchmakingService.dequeue(getSocketPlayerId(socket));
       } else if (socket.user.id) {
         matchmakingQueue.delete(socket.user.id);
         matchmakingService.dequeue(socket.user.id);
@@ -611,25 +722,89 @@ export function initializeSocket(httpServer: HTTPServer) {
 
       // Duel room cleanup and forfeit handling
       if (socket.roomCode && socket.isDuelRoom) {
+        const disconnectedPlayerId = getSocketPlayerId(socket);
+        const forfeitedPlayers = duelForfeitedPlayers.get(socket.roomCode) || new Set<string>();
+        forfeitedPlayers.add(disconnectedPlayerId);
+        duelForfeitedPlayers.set(socket.roomCode, forfeitedPlayers);
         io.to(socket.roomCode).emit('duel:opponent-disconnected', {
-          userId: socket.user.id || `guest:${socket.id}`,
+          userId: disconnectedPlayerId,
           username: socket.user.username,
         });
 
-        // Optional: If one player is already finished, trigger match completion early
+        // Treat refresh/disconnect during a duel as a forfeit for the disconnected player.
         if (socket.matchId) {
           try {
-            const { MatchResult } = await import('../models/index.js');
-            const resultsCount = await MatchResult.count({ where: { match_id: socket.matchId } });
-            if (resultsCount >= 1) {
-              console.log(`[DuelDisconnect] One player finished, the other disconnected. Completing match ${socket.matchId}.`);
-              const rankingUpdates = await rankingService.processMatchElo(socket.matchId);
+            const { Match } = await import('../models/index.js');
+            const matchRecord = await Match.findByPk(socket.matchId);
+            const players = duelParticipants.get(socket.roomCode) || [];
+            const remainingPlayer = players.find((player) => player.playerId !== disconnectedPlayerId);
+
+            if (!matchRecord?.completed_at && remainingPlayer) {
+              const roomProgress = duelProgress.get(socket.roomCode);
+              const winnerProgress = roomProgress?.get(remainingPlayer.playerId);
+              const loserProgress = roomProgress?.get(disconnectedPlayerId);
+              const startedAt = duelSessions.get(socket.roomCode)?.startedAt;
+              const fallbackElapsed = startedAt
+                ? Math.max(1, Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000))
+                : 1;
+              const winnerTimeTaken = Math.max(1, winnerProgress?.timeTaken || fallbackElapsed);
+              const loserTimeTaken = Math.max(
+                winnerTimeTaken + 1,
+                (loserProgress?.timeTaken || fallbackElapsed) + 1
+              );
+
+              await matchService.saveResult({
+                matchId: socket.matchId,
+                userId: remainingPlayer.userId,
+                guestId: remainingPlayer.guestId,
+                wpm: winnerProgress?.wpm || 0,
+                accuracy: winnerProgress?.accuracy || 100,
+                timeTaken: winnerTimeTaken,
+              });
+
+              await matchService.saveResult({
+                matchId: socket.matchId,
+                userId: socket.user.isGuest ? null : socket.user.id,
+                guestId: socket.user.isGuest ? getGuestIdentity(socket) : null,
+                wpm: loserProgress?.wpm || 0,
+                accuracy: loserProgress?.accuracy || 0,
+                timeTaken: loserTimeTaken,
+              });
+
+              io.to(socket.roomCode).emit('duel:player-finished', {
+                userId: remainingPlayer.playerId,
+                username: remainingPlayer.username,
+                wpm: winnerProgress?.wpm || 0,
+                accuracy: winnerProgress?.accuracy || 100,
+                timeTaken: winnerTimeTaken,
+              });
+
+              io.to(socket.roomCode).emit('duel:player-finished', {
+                userId: disconnectedPlayerId,
+                username: socket.user.username,
+                wpm: loserProgress?.wpm || 0,
+                accuracy: loserProgress?.accuracy || 0,
+                timeTaken: loserTimeTaken,
+              });
+
+              await matchService.completeMatch(socket.matchId);
+              const rankingUpdates = (await rankingService.processMatchElo(socket.matchId)) || [];
               io.to(socket.roomCode).emit('duel:complete', { rankingUpdates });
+
+              const room = await roomService.getRoomByCode(socket.roomCode);
+              if (room) {
+                await roomService.updateRoomStatus(room.id, 'completed');
+              }
+            duelForfeitedPlayers.delete(socket.roomCode);
             }
           } catch (e) {
             console.error('Error completing duel on disconnect:', e);
           }
         }
+
+        duelSessions.delete(socket.roomCode);
+        duelParticipants.delete(socket.roomCode);
+        duelProgress.delete(socket.roomCode);
         socket.leave(socket.roomCode);
       }
     });
