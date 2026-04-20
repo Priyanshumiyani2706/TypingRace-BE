@@ -107,6 +107,13 @@ export const matchService = {
     return { match, results };
   },
 
+  async getActiveMatchByRoomId(roomId: string) {
+    return Match.findOne({
+      where: { room_id: roomId, completed_at: null },
+      order: [['created_at', 'DESC']],
+    });
+  },
+
   async getMatchById(matchId: string) {
     const match = await Match.findByPk(matchId, {
       include: [

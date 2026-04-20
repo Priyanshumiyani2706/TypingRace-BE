@@ -89,6 +89,14 @@ export function initializeSocket(httpServer: HTTPServer) {
     const fallbackUsername = s.handshake.auth?.username || 'Guest';
     const guestId = s.handshake.auth?.guestId || null;
 
+    logger.info('socket:handshake', {
+      socketId: s.id,
+      hasJwt: !!(token && token !== 'guest'),
+      guestIdPresent: !!guestId,
+      username: fallbackUsername,
+      origin: s.handshake.headers?.origin ?? null,
+    });
+
     if (token && token !== 'guest') {
       try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET!) as any;
@@ -127,10 +135,15 @@ export function initializeSocket(httpServer: HTTPServer) {
     socket.on('room:join', async (data: { roomCode: string }) => {
       try {
         const normalizedCode = data.roomCode.toUpperCase();
+        const joiningPlayerId = getSocketPlayerId(socket);
         logger.info('room:join', {
           roomCode: normalizedCode,
           original: data.roomCode,
           username: socket.user.username,
+          socketId: socket.id,
+          isGuest: socket.user.isGuest,
+          joiningPlayerId,
+          handshakeGuestId: socket.user.guestId ?? null,
         });
 
         // Idempotency: if this socket is already in this room, just re-sync state
@@ -156,7 +169,6 @@ export function initializeSocket(httpServer: HTTPServer) {
           status: room.get('status'),
         });
 
-        const joiningPlayerId = getSocketPlayerId(socket);
         if (room.room_type === 'duel' && duelForfeitedPlayers.get(normalizedCode)?.has(joiningPlayerId)) {
           socket.emit('duel:rejoin-blocked', {
             roomCode: normalizedCode,
@@ -255,6 +267,12 @@ export function initializeSocket(httpServer: HTTPServer) {
           }
         }
       } catch (error: any) {
+        logger.error('room:join failed', {
+          message: error?.message,
+          stack: error?.stack,
+          roomCode: data?.roomCode,
+          socketId: socket.id,
+        });
         socket.emit('room:error', { message: error.message });
       }
     });
@@ -304,14 +322,29 @@ export function initializeSocket(httpServer: HTTPServer) {
         try {
           const room = await roomService.getRoomByCode(socket.roomCode);
           const hostPid = getHostParticipantId(room as any);
-          const isHost = hostPid && socket.participantId && hostPid === socket.participantId;
+          const roomHostUserId = (room as any)?.host_user_id ?? (room as any)?.get?.('host_user_id');
+          const loggedInHost =
+            !!room &&
+            !socket.user.isGuest &&
+            !!roomHostUserId &&
+            !!socket.user.id &&
+            String(socket.user.id) === String(roomHostUserId);
+          const actingHostPid =
+            loggedInHost && socket.participantId
+              ? socket.participantId
+              : hostPid;
+          const isHost =
+            !!actingHostPid &&
+            !!socket.participantId &&
+            socket.participantId === actingHostPid &&
+            (!!hostPid || loggedInHost);
 
-          logger.info('room:start', { roomCode: socket.roomCode, isHost, hostPid });
+          logger.info('room:start', { roomCode: socket.roomCode, isHost, hostPid, actingHostPid, loggedInHost });
 
           if (room && isHost) {
             // Check if all OTHER players are ready
             const participants = (room as any).participants || [];
-            const nonHostParticipants = participants.filter((p: any) => p.id !== hostPid);
+            const nonHostParticipants = participants.filter((p: any) => p.id !== actingHostPid);
             const allReady = nonHostParticipants.every((p: any) => p.is_ready);
             const minPlayers = participants.length >= 2;
 
@@ -346,6 +379,12 @@ export function initializeSocket(httpServer: HTTPServer) {
                 matchId: match.id,
               });
             }, 3000);
+          } else if (!room) {
+            socket.emit('room:error', { message: 'Room not found' });
+          } else if (!actingHostPid && roomHostUserId) {
+            socket.emit('room:error', {
+              message: 'Could not resolve room host; try leaving and rejoining the lobby.',
+            });
           } else {
             socket.emit('room:error', { message: 'Only the host can start the race' });
           }
@@ -795,7 +834,7 @@ export function initializeSocket(httpServer: HTTPServer) {
               if (room) {
                 await roomService.updateRoomStatus(room.id, 'completed');
               }
-            duelForfeitedPlayers.delete(socket.roomCode);
+              duelForfeitedPlayers.delete(socket.roomCode);
             }
           } catch (e) {
             console.error('Error completing duel on disconnect:', e);

@@ -3,6 +3,7 @@ import { guestOrAuthMiddleware as guestOrAuth } from '../middleware/guestOrAuth.
 import {
   createRoom,
   getRoomByCode,
+  getActiveMatchForRoomCode,
   getRoomById,
   getPublicRooms,
   joinRandomRoom,
@@ -16,6 +17,7 @@ const router = express.Router();
 router.post('/', guestOrAuth, validate(schemas.createRoom), createRoom);
 router.get('/public', getPublicRooms);
 router.get('/join-random', joinRandomRoom);
+router.get('/code/:code/active-match', getActiveMatchForRoomCode);
 router.get('/code/:code', getRoomByCode);
 router.get('/:id', getRoomById);
 router.patch('/:id', guestOrAuth, updateRoom);

@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { roomService } from '../services/roomService.js';
+import { matchService } from '../services/matchService.js';
 
 export const createRoom = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -62,6 +63,43 @@ export const getRoomByCode = async (req: Request, res: Response): Promise<void> 
   } catch (error) {
     console.error('Error fetching room:', error);
     res.status(500).json({ error: 'Failed to fetch room' });
+  }
+};
+
+/** Latest in-progress match for a room (for clients that navigated after `race:start` was emitted). */
+export const getActiveMatchForRoomCode = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { code } = req.params;
+    if (Array.isArray(code)) {
+      res.status(400).json({ error: 'Invalid room code' });
+      return;
+    }
+    const room = await roomService.getRoomByCode(code);
+    if (!room) {
+      res.status(404).json({ error: 'Room not found' });
+      return;
+    }
+    const status = room.get?.('status') ?? (room as { status?: string }).status;
+    if (status !== 'in_progress') {
+      res.json({ match: null });
+      return;
+    }
+    const roomId = room.get?.('id') ?? (room as { id: string }).id;
+    const match = await matchService.getActiveMatchByRoomId(roomId);
+    if (!match) {
+      res.json({ match: null });
+      return;
+    }
+    res.json({
+      match: {
+        id: match.id,
+        text_content: match.text_content,
+        room_id: roomId,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching active match:', error);
+    res.status(500).json({ error: 'Failed to fetch active match' });
   }
 };
 
